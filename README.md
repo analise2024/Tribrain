@@ -22,14 +22,55 @@ TriBrain addresses this with:
 
 ## Architecture
 
-```mermaid
-flowchart LR
-  A[World Model] -->|video/rollout| B[Critic Team]
-  B --> C[Belief Update (Bayesian)]
-  C --> D[Meta Controller (stop/rollback/drift)]
-  D --> E[Executive Refiner (prompt/action edits)]
-  E --> A
-```
+flowchart TD
+  %% --- Interaction loop ---
+  WM[World Model / WoW Adapter<br/>(subprocess, no WoW changes)]
+  WM -->|rollout video + metadata| FS[Frame Sampler]
+  FS --> ONT[Ontology Extractor<br/>(feature extraction + compression)]
+  ONT --> CTX[Context Vector]
+
+  %% --- Critics + reward ---
+  CTX --> CR[Critic Team]
+  WM --> CR
+  CR -->|scores + JSON diagnostics| VREL[Critic Reliability Update<br/>(Bayesian)]
+  CR --> RM[Reward Model<br/>(preference / Bayesian linear)]
+  RM --> R[Reward Signal]
+
+  %% --- 3-brain controller ---
+  CTX --> BAY[Bayesian Brain<br/>(belief state + uncertainty)]
+  VREL --> BAY
+  R --> BAY
+
+  CTX --> META[Metacognitive Brain<br/>(budget + drift/plateau + learn-to-stop)]
+  R --> META
+
+  CTX --> EXEC[Executive Brain<br/>(deterministic plan + optional LLM refiner)]
+  BAY --> COORD[Coordinator + Hierarchical Contextual Controller<br/>(Thompson/BO-like)]
+  META --> COORD
+  EXEC --> COORD
+
+  COORD -->|select arm / policy + prompt/action edits| WM
+
+  %% --- Memory + continual improvement ---
+  WM --> MEM[Episodic Memory (SQLite)<br/>(atomic/idempotent migrations)]
+  CR --> MEM
+  R --> MEM
+  COORD --> MEM
+
+  MEM --> REPLAY[Episodic Replay + Self-healing]
+  REPLAY -->|update| COORD
+  REPLAY -->|update| META
+  REPLAY -->|update| VREL
+  REPLAY -->|export| DATA[Datasets<br/>(episodes + preference pairs)]
+  DATA --> RM
+
+  %% --- Cost/trace observability ---
+  COORD --> COST[Cost & Budget Logger<br/>(time/calls/tokens)]
+  WM --> TRACE[Trace Writer (JSONL + fsync)]
+  CR --> TRACE
+  COORD --> TRACE
+  COST --> TRACE
+
 
 ## Install
 
@@ -147,4 +188,4 @@ python -m tribrain.cli export-dataset   --run-dir outputs/wow_run   --out datase
 ```
 
 ## License
-MIT
+Apache 2.0
