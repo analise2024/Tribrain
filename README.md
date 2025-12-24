@@ -14,49 +14,44 @@ Refinement loops often fail in predictable ways:
 - compute is wasted past the point of diminishing returns
 
 TriBrain addresses this with:
-- **Executive brain**: deterministic refiner policy + **optional LLM refiner** (budgeted + cached)
-- **Bayesian belief brain**: belief over failure modes + critic reliability (calibration-ready)
-- **Metacognitive brain**: stop/plateau/drift control + hard budgets (time/tokens/calls)
-- **Ontology layer**: extract a task ontology and compress it into the prompt (token saver)
-- **RL (lightweight)**: Thompson-sampling bandit learns which refinement “focus” works best
 
+- **Executive brain:** deterministic refiner policy + optional LLM refiner (budgeted + cached)
+- **Bayesian belief brain:** belief over failure modes + critic reliability (calibration-ready)
+- **Metacognitive brain:** stop/plateau/drift control + hard budgets (time/tokens/calls)
+- **Ontology layer:** extract a task ontology and compress it into the prompt (token saver)
+- **RL (lightweight):** Thompson-sampling bandit learns which refinement “focus” works best
+
+## Architecture
+
+```mermaid
 flowchart TD
-  %% --- Interaction loop ---
   WM["World Model / WoW Adapter<br/>(subprocess, no WoW changes)"]
   FS["Frame Sampler"]
   ONT["Ontology Extractor<br/>(feature extraction + compression)"]
   CTX["Context Vector"]
 
-  %% --- Critics + reward ---
   CR["Critic Team<br/>(incl. optional VLM critic)"]
   VREL["Critic Reliability Update<br/>(Bayesian)"]
   RM["Reward Model<br/>(preference / Bayesian linear)"]
   R["Reward Signal"]
 
-  %% --- 3-brain controller ---
   BAY["Bayesian Brain<br/>(belief state + uncertainty)"]
   META["Metacognitive Brain<br/>(budget + drift/plateau + learn-to-stop)"]
   EXEC["Executive Brain<br/>(deterministic plan + optional LLM refiner)"]
   COORD["Coordinator + Hierarchical Contextual Controller<br/>(Thompson/BO-like)"]
 
-  %% --- Memory + replay ---
   MEM["Episodic Memory (SQLite)<br/>(atomic/idempotent migrations)"]
   REPLAY["Episodic Replay + Self-healing"]
   DATA["Datasets<br/>(episodes + preference pairs)"]
 
-  %% --- Observability / cost control ---
-  TRACE["Trace Writer (JSONL + fsync)"]
+  TRACE["Trace Writer<br/>(JSONL + fsync)"]
   COST["Cost & Budget Logger<br/>(time/calls/tokens)"]
 
-  WM -->|rollout video + metadata| FS
-  FS --> ONT
-  ONT --> CTX
-
+  WM -->|rollout video + metadata| FS --> ONT --> CTX
   CTX --> CR
   WM --> CR
   CR -->|scores + JSON diagnostics| VREL
-  CR --> RM
-  RM --> R
+  CR --> RM --> R
 
   CTX --> BAY
   VREL --> BAY
@@ -64,13 +59,11 @@ flowchart TD
 
   CTX --> META
   R --> META
-
   CTX --> EXEC
 
   BAY --> COORD
   META --> COORD
   EXEC --> COORD
-
   COORD -->|select arm / policy + prompt/action edits| WM
 
   WM --> MEM
@@ -81,7 +74,36 @@ flowchart TD
   MEM --> REPLAY
   REPLAY -->|update| COORD
   REPLAY -->|update| META
-  REPLAY -->|update| VRE
+  REPLAY -->|update| VREL
+  REPLAY -->|export| DATA
+  DATA --> RM
+
+  WM --> TRACE
+  CR --> TRACE
+  COORD --> TRACE
+  COST --> TRACE
+
+Key fixes vs your ugly version:
+- it’s inside a **```mermaid** fenced block
+- every node/edge is on its own line
+- line breaks inside labels use `<br/>` (safe on GitHub)
+
+---
+
+## Option B: Use an image (always pretty on GitHub)
+I generated a clean architecture PNG you can drop into your repo:
+
+[Download **tribrain_architecture_v6_2.png**](sandbox:/mnt/data/tribrain_architecture_v6_2.png)
+
+Then in README:
+
+```md
+## Architecture
+
+![TriBrain Architecture](docs/tribrain_architecture_v6_2.png)
+
+
+
 
 
 ## Install
