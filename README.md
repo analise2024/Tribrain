@@ -20,56 +20,68 @@ TriBrain addresses this with:
 - **Ontology layer**: extract a task ontology and compress it into the prompt (token saver)
 - **RL (lightweight)**: Thompson-sampling bandit learns which refinement “focus” works best
 
-## Architecture
-
 flowchart TD
   %% --- Interaction loop ---
-  WM[World Model / WoW Adapter<br/>(subprocess, no WoW changes)]
-  WM -->|rollout video + metadata| FS[Frame Sampler]
-  FS --> ONT[Ontology Extractor<br/>(feature extraction + compression)]
-  ONT --> CTX[Context Vector]
+  WM["World Model / WoW Adapter<br/>(subprocess, no WoW changes)"]
+  FS["Frame Sampler"]
+  ONT["Ontology Extractor<br/>(feature extraction + compression)"]
+  CTX["Context Vector"]
 
   %% --- Critics + reward ---
-  CTX --> CR[Critic Team]
-  WM --> CR
-  CR -->|scores + JSON diagnostics| VREL[Critic Reliability Update<br/>(Bayesian)]
-  CR --> RM[Reward Model<br/>(preference / Bayesian linear)]
-  RM --> R[Reward Signal]
+  CR["Critic Team<br/>(incl. optional VLM critic)"]
+  VREL["Critic Reliability Update<br/>(Bayesian)"]
+  RM["Reward Model<br/>(preference / Bayesian linear)"]
+  R["Reward Signal"]
 
   %% --- 3-brain controller ---
-  CTX --> BAY[Bayesian Brain<br/>(belief state + uncertainty)]
+  BAY["Bayesian Brain<br/>(belief state + uncertainty)"]
+  META["Metacognitive Brain<br/>(budget + drift/plateau + learn-to-stop)"]
+  EXEC["Executive Brain<br/>(deterministic plan + optional LLM refiner)"]
+  COORD["Coordinator + Hierarchical Contextual Controller<br/>(Thompson/BO-like)"]
+
+  %% --- Memory + replay ---
+  MEM["Episodic Memory (SQLite)<br/>(atomic/idempotent migrations)"]
+  REPLAY["Episodic Replay + Self-healing"]
+  DATA["Datasets<br/>(episodes + preference pairs)"]
+
+  %% --- Observability / cost control ---
+  TRACE["Trace Writer (JSONL + fsync)"]
+  COST["Cost & Budget Logger<br/>(time/calls/tokens)"]
+
+  WM -->|rollout video + metadata| FS
+  FS --> ONT
+  ONT --> CTX
+
+  CTX --> CR
+  WM --> CR
+  CR -->|scores + JSON diagnostics| VREL
+  CR --> RM
+  RM --> R
+
+  CTX --> BAY
   VREL --> BAY
   R --> BAY
 
-  CTX --> META[Metacognitive Brain<br/>(budget + drift/plateau + learn-to-stop)]
+  CTX --> META
   R --> META
 
-  CTX --> EXEC[Executive Brain<br/>(deterministic plan + optional LLM refiner)]
-  BAY --> COORD[Coordinator + Hierarchical Contextual Controller<br/>(Thompson/BO-like)]
+  CTX --> EXEC
+
+  BAY --> COORD
   META --> COORD
   EXEC --> COORD
 
   COORD -->|select arm / policy + prompt/action edits| WM
 
-  %% --- Memory + continual improvement ---
-  WM --> MEM[Episodic Memory (SQLite)<br/>(atomic/idempotent migrations)]
+  WM --> MEM
   CR --> MEM
   R --> MEM
   COORD --> MEM
 
-  MEM --> REPLAY[Episodic Replay + Self-healing]
+  MEM --> REPLAY
   REPLAY -->|update| COORD
   REPLAY -->|update| META
-  REPLAY -->|update| VREL
-  REPLAY -->|export| DATA[Datasets<br/>(episodes + preference pairs)]
-  DATA --> RM
-
-  %% --- Cost/trace observability ---
-  COORD --> COST[Cost & Budget Logger<br/>(time/calls/tokens)]
-  WM --> TRACE[Trace Writer (JSONL + fsync)]
-  CR --> TRACE
-  COORD --> TRACE
-  COST --> TRACE
+  REPLAY -->|update| VRE
 
 
 ## Install
