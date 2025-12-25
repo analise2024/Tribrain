@@ -1,0 +1,94 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tribrain
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tribrain-config
+  namespace: tribrain
+data:
+  TRIBRAIN_S3_BUCKET: "meu-bucket-tribrain-checkpoints"
+  LLM_BACKEND: "ollama"
+  OLLAMA_BASE_URL: "http://ollama-service.tribrain.svc.cluster.local:11434"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tribrain-worker
+  namespace: tribrain
+  labels:
+    app: tribrain
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: tribrain
+  template:
+    metadata:
+      labels:
+        app: tribrain
+    spec:
+      containers:
+      - name: tribrain
+        image: seu-registro/tribrain:latest # Substitua pelo caminho da sua imagem
+        imagePullPolicy: Always
+        env:
+        # Credenciais da AWS vindas do Secret
+        - name: AWS_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              name: aws-credentials
+              key: AWS_ACCESS_KEY_ID
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: aws-credentials
+              key: AWS_SECRET_ACCESS_KEY
+        - name: AWS_REGION
+          valueFrom:
+            secretKeyRef:
+              name: aws-credentials
+              key: AWS_REGION
+        # Configurações vindas do ConfigMap
+        - name: TRIBRAIN_S3_BUCKET
+          valueFrom:
+            configMapKeyRef:
+              name: tribrain-config
+              key: TRIBRAIN_S3_BUCKET
+        - name: LLM_BACKEND
+          valueFrom:
+            configMapKeyRef:
+              name: tribrain-config
+              key: LLM_BACKEND
+        - name: OLLAMA_BASE_URL
+          valueFrom:
+            configMapKeyRef:
+              name: tribrain-config
+              key: OLLAMA_BASE_URL
+        resources:
+          limits:
+            cpu: "1000m"
+            memory: "2Gi"
+          requests:
+            cpu: "500m"
+            memory: "1Gi"
+        # O Tribrain é um worker, então ele pode rodar um comando específico ou aguardar jobs
+        command: ["python", "-m", "tribrain.cli"]
+        args: ["--help"] # Em produção, isso seria substituído pelo comando de execução real
+---
+# Exemplo de Service (caso o Tribrain venha a expor uma API no futuro)
+apiVersion: v1
+kind: Service
+metadata:
+  name: tribrain-service
+  namespace: tribrain
+spec:
+  selector:
+    app: tribrain
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 8000 # Porta hipotética para uma API FastAPI
+  type: ClusterIP
