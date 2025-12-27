@@ -1,501 +1,307 @@
-"""
-Bi-Phasic Replay Engine (TriBrain Section 4.4.3)
-
-This module implements a two-phase replay strategy to stabilize iterative refinement loops:
-
-1) Online micro-replay:
-   - Small, targeted batches during active refinement.
-   - Focuses on recent, high-surprise/high-error episodes from the current task family.
-
-2) Offline consolidation ("sleep"):
-   - Larger, interleaved batches spanning task families and time.
-   - Designed to reduce interference and long-horizon drift via interleaving + diversity constraints.
-
-Key robustness features in this implementation:
-- Safe behavior on empty inputs (no ZeroDivisionError / quantile on empty list).
-- Deterministic sampling option via injected RNG (reproducibility).
-- Replay-bias mitigation via replay-count penalties and diversity-based sampling.
-- Flexible EpisodeStore adapter: works with common method names or plain in-memory lists.
-
-Expected episode fields (best-effort; only some are required):
-- id (str) or episode_id (str) [optional but strongly recommended]
-- task_family (str) [recommended]
-- timestamp (float seconds) [recommended]
-- iteration (int) [recommended]
-- delta (float) and/or improvement (float) [optional, used for TD-error proxy]
-- critic_scores (dict[str,float]) or fused_scores (dict[str,float]) [optional]
-
-The engine never mutates episodes; it only selects them for replay.
-"""
-
 from __future__ import annotations
 
-import hashlib
+import json
+import os
 import random
+import subprocess
 import time
+from contextlib import suppress
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterable, List, Optional, Protocol, Sequence, Tuple
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+from .belief.bayesian_belief import BeliefConfig, BayesianBeliefBrain
+from .budget.budget import BudgetConfig, BudgetController, BudgetState
+from .controller.bandit import PromptEditBandit
+from .controller.hierarchical_controller import HierarchicalContextualTS
+from .critics.critic_team import CriticTeam
+from .critics.simple_critics import InstructionFollowingCritic, PhysicsSanityCritic
+from .dashboard.report import build_report
+from .memory.episodic import Episode, EpisodeStore, make_run_id
+from .memory.semantic_cortex import SemanticCortex
+from .memory.replay import ReplayConfig, ReplayEngine
+from .meta.meta_controller import MetaConfig, MetaController
+from .meta.meta_value_model import MetaValueModel, MetaValueModelConfig
+from .ontology.extractor import OntologyExtractor
+from .reward.preference_dataset import build_preference_pairs
+from .reward.reward_model import RewardModelConfig, SimpleRewardModel
+from .storage.calibration_store import CalibrationStore
+from .storage.checkpoint_store import CheckpointStore
+from .storage.trace_writer import JsonlTraceWriter
+from .types import GoalSpec, RunResult
 
 
-@dataclass(frozen=True)
-class ReplayBatch:
-    """Batch of episodes for replay."""
-    episodes: List[Dict[str, Any]]
-    phase: str  # "online" or "offline"
-    interleaved: bool = False
-    timestamp: float = 0.0
+@dataclass
+class OrchestratorConfig:
+    max_iters: int = 4
+    target_score: float = 0.85
+    patience: int = 2
+    min_delta: float = 0.01
+    drift_threshold: float = 0.15
+    # Budgets: hard caps to prevent runaway inference cost.
+    max_wall_time_s: float = 20 * 60
+    max_iter_time_s: float = 10 * 60
+    llm_max_calls: int = 4
+    llm_max_tokens: int = 1200
+    llm_policy: str = "adaptive"  # adaptive|always|never
+    # RL / Controller
+    controller: str = "hierarchical"  # hierarchical|bandit
+    bow_dim: int = 32
+    controller_noise_var: float = 0.10
+    # Optional LLM refiner and ontology extractor (can be disabled).
+    use_llm_refiner: bool = False
+    use_ontology: bool = True
+    # Continual learning via episodic replay
+    use_episodic_memory: bool = True
+    episodes_db: str = "episodes.sqlite"
+    replay_k: int = 256
+    replay_strategy: str = "uniform"  # uniform|nearest|biphase
+    replay_seed: int = 0
+
+    # Optional semantic cortex (complementary long-horizon memory)
+    use_semantic_cortex: bool = False
+    semantic_cortex_db: str = "semantic_cortex.sqlite"
+    semantic_consolidate_every: int = 0  # 0=never, N=every N episodes
+
+    # Metacognitive value model (learns when continuing is worth it)
+    use_meta_value_model: bool = True
+    meta_value_min_updates: int = 30
+    meta_value_min_expected_delta: float = 0.005
+    meta_value_cost_penalty: float = 0.15
+    meta_value_min_value: float = 0.0
 
 
-class EpisodeStore(Protocol):
-    """
-    Optional protocol for an EpisodeStore used by this replay engine.
-
-    If your store implements any of these, the engine will use them:
-      - get_recent_episodes(task_family: str, current_iter: int, max_age_iters: int, limit: int) -> list[dict]
-      - get_recent(task_family: str, limit: int) -> list[dict]
-      - get_by_family(task_family: str, limit: int) -> list[dict]
-      - list_episodes() -> list[dict]
-
-    Otherwise, the engine will try to treat the store as an iterable of episode dicts.
-    """
-    ...
-
-
-def _canonical_episode_id(ep: Dict[str, Any]) -> str:
-    """Best-effort stable identifier for an episode."""
-    for k in ("id", "episode_id", "uuid"):
-        v = ep.get(k)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-    # fallback: hash a canonical JSON projection (stable, but may be heavy if ep is huge)
-    try:
-        payload = json_dumps_canonical(ep)
-    except Exception:
-        payload = repr(ep)
-    return "hash:" + hashlib.sha1(payload.encode("utf-8")).hexdigest()
-
-
-def json_dumps_canonical(obj: Any) -> str:
-    import json
-    return json.dumps(obj, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
-
-
-def _get_float(ep: Dict[str, Any], key: str, default: float = 0.0) -> float:
-    v = ep.get(key, default)
-    try:
-        return float(v)
-    except Exception:
-        return float(default)
-
-
-class BiPhaseReplayEngine:
-    """
-    Two-phase replay system for stable continual learning.
-    """
-
+class TriBrainOrchestrator:
     def __init__(
         self,
-        online_batch_size: int = 8,
-        offline_batch_size: int = 64,
-        interleave_ratio: float = 0.5,          # fraction sampled from "old" set in offline
-        online_lr: float = 0.001,
-        offline_lr: float = 0.01,
-        max_replays_per_episode: int = 25,      # soft cap to prevent "rumination"
-        replay_penalty_alpha: float = 0.05,     # how strongly replay counts downweight sampling
-        diversity_key: str = "signature",       # key used to enforce diversity if present
-        rng: Optional[random.Random] = None,
-    ):
-        if online_batch_size <= 0:
-            raise ValueError("online_batch_size must be > 0")
-        if offline_batch_size <= 0:
-            raise ValueError("offline_batch_size must be > 0")
-        if not (0.0 <= interleave_ratio <= 1.0):
-            raise ValueError("interleave_ratio must be in [0,1]")
-
-        self.online_batch_size = online_batch_size
-        self.offline_batch_size = offline_batch_size
-        self.interleave_ratio = interleave_ratio
-        self.online_lr = online_lr
-        self.offline_lr = offline_lr
-
-        self.max_replays_per_episode = max_replays_per_episode
-        self.replay_penalty_alpha = replay_penalty_alpha
-        self.diversity_key = diversity_key
-
-        self._rng = rng or random.Random()
-
-        # Track which episodes have been replayed (by stable ID)
-        self.replay_counts: Dict[str, int] = {}
-
-    # -----------------------------
-    # Public API
-    # -----------------------------
-
-    def sample_online_batch(
-        self,
-        episode_store: Any,
-        current_task_family: str,
-        current_iter: int,
-    ) -> ReplayBatch:
-        """
-        Sample a small batch for online micro-replay.
-
-        Focus on recent, high-surprise episodes from the current task.
-        """
-        recent = self._get_recent_episodes(
-            episode_store,
-            task_family=current_task_family,
-            current_iter=current_iter,
-            max_age_iters=10,
-            limit=max(self.online_batch_size * 4, self.online_batch_size),
-        )
-        if not recent:
-            return ReplayBatch(episodes=[], phase="online", interleaved=False, timestamp=time.time())
-
-        prioritized = self._prioritize_for_sampling(recent)
-
-        # Enforce replay cap + diversity
-        batch = self._sample_diverse(prioritized, k=self.online_batch_size)
-
-        self._mark_replayed(batch)
-        return ReplayBatch(episodes=batch, phase="online", interleaved=False, timestamp=time.time())
-
-    def sample_offline_batch(
-        self,
-        episode_store: Any,
-        task_families: List[str],
-    ) -> ReplayBatch:
-        """
-        Sample a large interleaved batch for offline consolidation.
-
-        Mix episodes across task families and time to reduce interference.
-        """
-        if not task_families:
-            return ReplayBatch(episodes=[], phase="offline", interleaved=False, timestamp=time.time())
-
-        per_family = max(1, (self.offline_batch_size // len(task_families)) + 1)
-
-        all_eps: List[Dict[str, Any]] = []
-        for fam in task_families:
-            all_eps.extend(self._get_episodes_by_family(episode_store, task_family=fam, limit=per_family * 4))
-
-        if not all_eps:
-            return ReplayBatch(episodes=[], phase="offline", interleaved=False, timestamp=time.time())
-
-        # Split into old/new by timestamp percentile (robust to missing timestamps)
-        ts = [float(ep.get("timestamp", 0.0) or 0.0) for ep in all_eps]
-        ts_sorted = sorted(ts)
-        # 30th percentile index
-        idx = int(0.3 * (len(ts_sorted) - 1))
-        old_threshold = ts_sorted[idx] if ts_sorted else 0.0
-
-        old_eps = [ep for ep in all_eps if float(ep.get("timestamp", 0.0) or 0.0) < old_threshold]
-        new_eps = [ep for ep in all_eps if float(ep.get("timestamp", 0.0) or 0.0) >= old_threshold]
-
-        n_old = int(self.offline_batch_size * self.interleave_ratio)
-        n_new = self.offline_batch_size - n_old
-
-        # Prioritize within each pool
-        old_pool = self._prioritize_for_sampling(old_eps)
-        new_pool = self._prioritize_for_sampling(new_eps)
-
-        sampled: List[Dict[str, Any]] = []
-        sampled.extend(self._sample_diverse(old_pool, k=n_old))
-        sampled.extend(self._sample_diverse(new_pool, k=n_new))
-
-        # If one side was empty, top up from the other
-        if len(sampled) < self.offline_batch_size:
-            remaining = self.offline_batch_size - len(sampled)
-            fallback_pool = new_pool if len(new_pool) > len(old_pool) else old_pool
-            sampled.extend(self._sample_diverse(fallback_pool, k=remaining, already=sampled))
-
-        # Shuffle to truly interleave
-        self._rng.shuffle(sampled)
-
-        # Truncate to batch size
-        sampled = sampled[: self.offline_batch_size]
-
-        self._mark_replayed(sampled)
-
-        return ReplayBatch(episodes=sampled, phase="offline", interleaved=True, timestamp=time.time())
-
-    def apply_replay(
-        self,
-        batch: ReplayBatch,
-        update_fn: Callable[[Dict[str, Any], float], None],
+        out_dir: Path,
+        cfg: OrchestratorConfig,
+        *,
+        llm_refiner: Any | None = None,
+        ontology_extractor: OntologyExtractor | None = None,
     ) -> None:
-        """
-        Apply replay updates with phase-appropriate learning rate.
+        self.out_dir = Path(out_dir)
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        self.cfg = cfg
 
-        update_fn(episode, lr) is user-provided (e.g., update meta-value model / critic reliabilities / schemas).
-        """
-        lr = self.online_lr if batch.phase == "online" else self.offline_lr
-        for ep in batch.episodes:
-            update_fn(ep, lr)
+        # Storage
+        self.calibration = CalibrationStore(self.out_dir / "calibration.sqlite3")
+        self.checkpoints = CheckpointStore(self.out_dir / "checkpoint.json")
 
-    def get_replay_stats(self) -> Dict[str, Any]:
-        """Get replay statistics."""
-        counts = list(self.replay_counts.values())
-        return {
-            "unique_episodes_replayed": len(self.replay_counts),
-            "avg_replay_count": sum(counts) / len(counts) if counts else 0.0,
-            "max_replay_count": max(counts) if counts else 0,
-            "min_replay_count": min(counts) if counts else 0,
-        }
+        self.trace = JsonlTraceWriter(self.out_dir / "trace.jsonl")
+        # Run identity (set at run() time once the seed is known)
+        self.run_id = ""
 
-    # -----------------------------
-    # Internal helpers
-    # -----------------------------
+        # Episodic memory + replay (continual improvement without re-running expensive generations)
+        self.episode_store: EpisodeStore | None = None
+        self.replay_engine: ReplayEngine | None = None
+        self.semantic_cortex: SemanticCortex | None = None
+        if self.cfg.use_episodic_memory:
+            self.episode_store = EpisodeStore(self.out_dir / self.cfg.episodes_db)
+            self.replay_engine = ReplayEngine(
+                self.episode_store,
+                ReplayConfig(k=int(self.cfg.replay_k), strategy=str(self.cfg.replay_strategy), seed=int(self.cfg.replay_seed)),
+            )
 
-    def _mark_replayed(self, episodes: Sequence[Dict[str, Any]]) -> None:
-        for ep in episodes:
-            ep_id = _canonical_episode_id(ep)
-            self.replay_counts[ep_id] = self.replay_counts.get(ep_id, 0) + 1
+            if self.cfg.use_semantic_cortex:
+                # Separate DB: does not affect episodic migration/tests.
+                self.semantic_cortex = SemanticCortex(self.out_dir / self.cfg.semantic_cortex_db)
 
-    def _prioritize_for_sampling(self, episodes: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """
-        Prioritize by TD-error proxy, with penalties for over-replayed items.
-        """
-        scored: List[Tuple[float, Dict[str, Any]]] = []
-        for ep in episodes:
-            ep_id = _canonical_episode_id(ep)
-            replay_n = self.replay_counts.get(ep_id, 0)
-            if replay_n >= self.max_replays_per_episode:
-                continue
-            td = self._td_error_proxy(ep)
-            score = td - self.replay_penalty_alpha * replay_n
-            scored.append((score, ep))
+        # Metacognitive value model: learns marginal value of "one more iteration"
+        mv_cfg = MetaValueModelConfig(
+            min_updates=int(self.cfg.meta_value_min_updates),
+            min_expected_delta=float(self.cfg.meta_value_min_expected_delta),
+            cost_penalty=float(self.cfg.meta_value_cost_penalty),
+            min_value=float(self.cfg.meta_value_min_value),
+        )
+        self.meta_value_model = MetaValueModel(mv_cfg) if self.cfg.use_meta_value_model else None
 
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return [ep for _, ep in scored]
+        # Critics
+        critics = [InstructionFollowingCritic(), PhysicsSanityCritic()]
+        self.critic_team = CriticTeam(critics)
 
-    def _td_error_proxy(self, ep: Dict[str, Any]) -> float:
-        """
-        Proxy for "surprise": abs(predicted - observed).
+        # Brains
+        belief_cfg = BeliefConfig(drift_threshold=float(self.cfg.drift_threshold))
+        self.belief_brain = BayesianBeliefBrain(belief_cfg)
 
-        Uses available fields; if missing, falls back to |delta| or 0.
-        """
-        delta = _get_float(ep, "delta", 0.0)
-        improvement = _get_float(ep, "improvement", delta)
-        # High error = unexpected outcomes
-        return abs(delta - improvement)
+        meta_cfg = MetaConfig(
+            target_score=float(self.cfg.target_score),
+            patience=int(self.cfg.patience),
+            min_delta=float(self.cfg.min_delta),
+            drift_threshold=float(self.cfg.drift_threshold),
+        )
+        self.meta_controller = MetaController(meta_cfg)
 
-    def _sample_diverse(
-        self,
-        pool: Sequence[Dict[str, Any]],
-        k: int,
-        already: Optional[Sequence[Dict[str, Any]]] = None,
-    ) -> List[Dict[str, Any]]:
-        """
-        Sample up to k items from pool while enforcing diversity by diversity_key (if present).
-        Deterministic given rng seed.
-        """
-        if k <= 0 or not pool:
-            return []
+        # Reward model
+        rm_cfg = RewardModelConfig()
+        self.reward_model = SimpleRewardModel(rm_cfg)
 
-        already = list(already) if already else []
-        used_ids = {_canonical_episode_id(ep) for ep in already}
-        used_div = {ep.get(self.diversity_key) for ep in already if ep.get(self.diversity_key) is not None}
+        # Optional LLM refiner and ontology extractor
+        self.llm_refiner = llm_refiner
+        self.ontology_extractor = ontology_extractor
 
-        out: List[Dict[str, Any]] = []
-        for ep in pool:
-            if len(out) >= k:
-                break
-            ep_id = _canonical_episode_id(ep)
-            if ep_id in used_ids:
-                continue
-            div = ep.get(self.diversity_key)
-            if div is not None and div in used_div:
-                continue
-            out.append(ep)
-            used_ids.add(ep_id)
-            if div is not None:
-                used_div.add(div)
+        self.budget = BudgetController(
+            BudgetConfig(
+                max_wall_time_s=self.cfg.max_wall_time_s,
+                max_iter_time_s=self.cfg.max_iter_time_s,
+                llm_max_calls=self.cfg.llm_max_calls,
+                llm_max_tokens=self.cfg.llm_max_tokens,
+            )
+        )
+        self.budget_state = BudgetState(start_time=time.time())
 
-        # If not enough, fill without diversity constraint
-        if len(out) < k:
-            remaining = [ep for ep in pool if _canonical_episode_id(ep) not in used_ids]
-            # deterministic random fill
-            self._rng.shuffle(remaining)
-            out.extend(remaining[: (k - len(out))])
+        # Controller
+        self.bandit = None
+        self.controller = None
 
-        return out[:k]
-
-    def _get_recent_episodes(
-        self,
-        store: Any,
-        task_family: str,
-        current_iter: int,
-        max_age_iters: int,
-        limit: int,
-    ) -> List[Dict[str, Any]]:
-        """Best-effort retrieval of recent episodes."""
-        # Common method names
-        for name in ("get_recent_episodes", "recent_episodes", "fetch_recent_episodes"):
-            fn = getattr(store, name, None)
-            if callable(fn):
-                try:
-                    return list(fn(task_family=task_family, current_iter=current_iter, max_age_iters=max_age_iters, limit=limit))
-                except TypeError:
-                    # try positional
-                    try:
-                        return list(fn(task_family, current_iter, max_age_iters, limit))
-                    except Exception:
-                        pass
-
-        for name in ("get_recent", "recent", "fetch_recent"):
-            fn = getattr(store, name, None)
-            if callable(fn):
-                try:
-                    eps = list(fn(task_family=task_family, limit=limit))
-                except TypeError:
-                    try:
-                        eps = list(fn(task_family, limit))
-                    except Exception:
-                        eps = []
-                # filter by iteration if present
-                if eps:
-                    min_iter = current_iter - max_age_iters
-                    out = []
-                    for ep in eps:
-                        it = ep.get("iteration")
-                        if it is None:
-                            out.append(ep)
-                        else:
-                            try:
-                                if int(it) >= min_iter:
-                                    out.append(ep)
-                            except Exception:
-                                out.append(ep)
-                    return out[:limit]
-                return eps
-
-        # If store has list_episodes
-        fn = getattr(store, "list_episodes", None)
-        if callable(fn):
-            try:
-                all_eps = list(fn())
-            except Exception:
-                all_eps = []
+        if self.cfg.controller == "bandit":
+            self.bandit = PromptEditBandit(seed=0)
+            self.bandit_path = self.out_dir / "rl" / "prompt_edit_bandit.json"
+            self.bandit.load(self.bandit_path)
         else:
-            # Treat store as iterable
-            try:
-                all_eps = list(store)
-            except Exception:
-                all_eps = []
-
-        min_iter = current_iter - max_age_iters
-        out: List[Dict[str, Any]] = []
-        for ep in all_eps:
-            if not isinstance(ep, dict):
-                continue
-            if ep.get("task_family") != task_family:
-                continue
-            it = ep.get("iteration")
-            if it is None:
-                out.append(ep)
-            else:
+            # Context dimension depends on bow_dim and ContextFeatures design: 11 + 2*bow_dim
+            ctx_dim = 11 + 2 * int(self.cfg.bow_dim)
+            self.controller_path = self.out_dir / "rl" / "hierarchical_controller.json"
+            if self.controller_path.exists():
                 try:
-                    if int(it) >= min_iter:
-                        out.append(ep)
+                    self.controller = HierarchicalContextualTS.load(self.controller_path)
                 except Exception:
-                    out.append(ep)
+                    self.controller = HierarchicalContextualTS(ctx_dim=ctx_dim, noise_var=float(self.cfg.controller_noise_var), seed=0)
+            else:
+                self.controller = HierarchicalContextualTS(ctx_dim=ctx_dim, noise_var=float(self.cfg.controller_noise_var), seed=0)
 
-        # sort by iteration/time descending
-        out.sort(key=lambda e: (float(e.get("timestamp", 0.0) or 0.0), int(e.get("iteration", 0) or 0)), reverse=True)
-        return out[:limit]
+    def run(self, goal: GoalSpec, *, seed: int | None = None) -> RunResult:
+        if seed is None:
+            seed = int(time.time() * 1000) % (2**31 - 1)
+        random.seed(int(seed))
+        np.random.seed(int(seed))
 
-    def _get_episodes_by_family(
-        self,
-        store: Any,
-        task_family: str,
-        limit: int,
-    ) -> List[Dict[str, Any]]:
-        """Best-effort retrieval of episodes for a task family."""
-        for name in ("get_by_family", "get_episodes_by_family", "fetch_by_family"):
-            fn = getattr(store, name, None)
-            if callable(fn):
-                try:
-                    return list(fn(task_family=task_family, limit=limit))
-                except TypeError:
-                    try:
-                        return list(fn(task_family, limit))
-                    except Exception:
-                        pass
+        self.run_id = make_run_id(seed=int(seed), instruction=goal.instruction)
 
-        # fallback to list_episodes / iterable
-        fn = getattr(store, "list_episodes", None)
-        if callable(fn):
-            try:
-                all_eps = list(fn())
-            except Exception:
-                all_eps = []
-        else:
-            try:
-                all_eps = list(store)
-            except Exception:
-                all_eps = []
+        meta = self.meta_controller.initial_state()
+        best_score = -1.0
+        best_iter = -1
+        prev_score = 0.0
+        last_context = None
 
-        out = [ep for ep in all_eps if isinstance(ep, dict) and ep.get("task_family") == task_family]
-        out.sort(key=lambda e: float(e.get("timestamp", 0.0) or 0.0), reverse=True)
-        return out[:limit]
+        # pseudo-world-model loop placeholder (kept minimal for tests/demo)
+        for it in range(int(self.cfg.max_iters)):
+            # Budget checks
+            if self.budget.should_stop(self.budget_state):
+                break
 
+            iter_start = time.time()
 
-class ConsolidationScheduler:
-    """
-    Schedules offline consolidation ("sleep") phases.
+            # Dummy score curve for demo
+            score = float(min(1.0, 0.4 + 0.1 * it))
+            fused_scores = {"task": score}
+            critic_results = [{"critic_name": "demo", "scores": fused_scores, "notes": "", "extra": {}}]
 
-    Triggers offline replay when:
-    - sufficient new episodes accumulated, OR
-    - scheduled interval reached, OR
-    - plateau detected (optional)
-    """
+            # Belief update
+            self.belief_brain.update(fused_scores)
 
-    def __init__(
-        self,
-        episodes_per_consolidation: int = 100,
-        consolidation_interval_s: float = 3600.0,
-        force_on_plateau: bool = True,
-    ):
-        if episodes_per_consolidation <= 0:
-            raise ValueError("episodes_per_consolidation must be > 0")
-        if consolidation_interval_s <= 0:
-            raise ValueError("consolidation_interval_s must be > 0")
+            # Meta control update
+            meta = self.meta_controller.update(meta, score=score)
 
-        self.episodes_per_consolidation = episodes_per_consolidation
-        self.consolidation_interval_s = consolidation_interval_s
-        self.force_on_plateau = force_on_plateau
+            # Trace
+            trace_row = {
+                "iter_idx": it,
+                "run_id": self.run_id,
+                "prompt": f"demo-prompt-{it}",
+                "artifact_path": f"artifact-{it}.mp4",
+                "critic_results": critic_results,
+                "fused_scores": fused_scores,
+                "belief_probs": self.belief_brain.beliefs,
+                "overall_score": score,
+                "meta": {"goal_instruction": goal.instruction},
+            }
+            self.trace.write(trace_row)
 
-        self.episodes_since_last: int = 0
-        self.last_consolidation_time: float = time.time()
-        self.consolidation_count: int = 0
+            # Episode store (for replay)
+            if self.episode_store is not None:
+                ctx_vec = np.zeros((4,), dtype=np.float32)
+                meta_x = np.zeros((6,), dtype=np.float32)
+                ep = Episode(
+                    ts=time.time(),
+                    run_id=self.run_id,
+                    choice_iter_idx=int(it),
+                    ctx_vec=ctx_vec,
+                    meta_x=meta_x,
+                    arm="task",
+                    fused_scores_next=dict(fused_scores),
+                    overall_score_next=float(score),
+                    delta_score=float(score - prev_score),
+                    obs_reward=float(score - prev_score),
+                    smoothed_reward=float(score - prev_score),
+                    drift_flag_next=bool(meta.drift_flag),
+                    plateau_steps_next=int(meta.plateau_steps),
+                    iter_time_s_next=float(time.time() - iter_start),
+                    llm_calls_total_next=int(self.budget_state.llm_calls),
+                    llm_tokens_total_next=int(self.budget_state.llm_tokens_used),
+                )
+                with suppress(Exception):
+                    self.episode_store.add(ep)
+                if self.semantic_cortex is not None:
+                    with suppress(Exception):
+                        payload = {
+                            "run_id": ep.run_id,
+                            "iteration": int(ep.choice_iter_idx),
+                            "arm": ep.arm,
+                            "overall_score_next": float(ep.overall_score_next),
+                            "delta_score": float(ep.delta_score),
+                            "reward": float(ep.smoothed_reward),
+                            "drift_flag_next": bool(ep.drift_flag_next),
+                            "plateau_steps_next": int(ep.plateau_steps_next),
+                            "critic_scores": dict(ep.fused_scores_next),
+                        }
+                        self.semantic_cortex.append_episode(
+                            payload,
+                            task_family=str(ep.run_id),
+                            iteration=int(ep.choice_iter_idx),
+                            provenance="tribrain",
+                            external_validated=False,
+                            created_at=float(ep.ts),
+                        )
+                        # Optional gated consolidation.
+                        if int(self.cfg.semantic_consolidate_every) > 0 and int(ep.choice_iter_idx) % int(self.cfg.semantic_consolidate_every) == 0:
+                            with suppress(Exception):
+                                self.semantic_cortex.consolidate()
 
-    def notify_episode(self, n: int = 1) -> None:
-        """Call this after recording new episodes."""
-        self.episodes_since_last += max(0, int(n))
+            prev_score = float(score)
+            last_context = None
 
-    def should_run(self, current_time: Optional[float] = None, plateau_detected: bool = False) -> bool:
-        """Return True if offline consolidation should run now."""
-        now = time.time() if current_time is None else float(current_time)
-        time_due = (now - self.last_consolidation_time) >= self.consolidation_interval_s
-        count_due = self.episodes_since_last >= self.episodes_per_consolidation
-        plateau_due = plateau_detected and self.force_on_plateau
-        return bool(time_due or count_due or plateau_due)
+            if score > best_score:
+                best_score = float(score)
+                best_iter = int(it)
 
-    def mark_done(self, current_time: Optional[float] = None) -> None:
-        """Record that consolidation completed."""
-        now = time.time() if current_time is None else float(current_time)
-        self.episodes_since_last = 0
-        self.last_consolidation_time = now
-        self.consolidation_count += 1
+            if score >= float(self.cfg.target_score):
+                break
 
-    def get_stats(self, current_time: Optional[float] = None) -> Dict[str, Any]:
-        """Get scheduler statistics."""
-        now = time.time() if current_time is None else float(current_time)
-        return {
-            "consolidations_run": self.consolidation_count,
-            "episodes_since_last": self.episodes_since_last,
-            "time_since_last_s": max(0.0, now - self.last_consolidation_time),
-            "interval_s": self.consolidation_interval_s,
-            "episodes_per_consolidation": self.episodes_per_consolidation,
-        }
+        # Replay update at end (continual improvement)
+        replay_updates = 0
+        if self.replay_engine is not None and self.episode_store is not None:
+            query = None
+            with suppress(Exception):
+                replay_updates = int(
+                    self.replay_engine.replay_update(
+                        controller=self.controller,
+                        meta_value_model=self.meta_value_model,
+                        query_ctx=query,
+                    )
+                )
+
+        # Report
+        report = build_report(self.out_dir)
+        report_path = self.out_dir / "report.json"
+        report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        return RunResult(
+            run_id=self.run_id,
+            out_dir=self.out_dir,
+            best_score=float(best_score),
+            best_iter=int(best_iter),
+            iters=int(meta.iter_idx),
+            stop_reason=str(meta.stop_reason),
+        )
